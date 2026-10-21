@@ -1,0 +1,36 @@
+# Secrets (keep the template)
+.env
+.env.*
+!.env.example
+
+# Local data: SQLite database, Kite session token, market data, exports
+data/*
+!data/market/
+!data/exports/
+data/market/*
+data/exports/*
+!data/market/.gitkeep
+!data/exports/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
