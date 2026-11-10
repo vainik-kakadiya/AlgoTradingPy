@@ -37,6 +37,14 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Single-user login (see app/core/auth.py). No default credentials: login is impossible until set.
+    auth_enabled: bool = True
+    auth_required: bool = False  # true (set by docker-compose): refuse to start without AUTH_EMAIL / AUTH_PASSWORD
+    auth_email: str = ""
+    auth_password: str = ""
+    auth_secret: str = ""  # optional; otherwise a random secret is persisted in data/.auth_secret
+    auth_session_hours: float = Field(default=168.0, gt=0)  # 7 days
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
@@ -74,6 +82,7 @@ class Settings(BaseSettings):
             "capture_second_bars": self.capture_second_bars,
             "feed_stale_seconds": self.feed_stale_seconds,
             "execution_mode": "PAPER_ONLY",
+            "auth_enabled": self.auth_enabled,
         }
 
 

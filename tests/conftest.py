@@ -16,7 +16,14 @@ os.environ.update({
     "KITE_API_SECRET": "",
     "KITE_ACCESS_TOKEN": "",
     "CAPTURE_TICKS": "false",
+    "AUTH_ENABLED": "true",
+    "AUTH_EMAIL": "owner@example.com",
+    "AUTH_PASSWORD": "correct horse battery staple",
+    "AUTH_SECRET": "test-secret",
 })
+
+TEST_EMAIL = os.environ["AUTH_EMAIL"]
+TEST_PASSWORD = os.environ["AUTH_PASSWORD"]
 
 import pytest  # noqa: E402
 
@@ -43,4 +50,7 @@ def client(database: str):  # noqa: ANN201
     from app.main import app
 
     with TestClient(app) as c:
+        # Every API route requires a session; the shared client logs in once.
+        r = c.post("/api/auth/login", json={"email": TEST_EMAIL, "password": TEST_PASSWORD})
+        assert r.status_code == 200, r.text
         yield c

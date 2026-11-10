@@ -14,8 +14,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import install_error_handlers
-from app.api.routes import analytics, backtests, market, paper, strategies
+from app.api.routes import analytics, auth, backtests, market, paper, strategies
 from app.api.websocket import router as ws_router
+from app.core.auth import AuthMiddleware, credentials_configured
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.database.migrate import upgrade_database
@@ -30,11 +31,16 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
+    if settings.auth_enabled and settings.auth_required and not credentials_configured():
+        raise RuntimeError("AUTH_EMAIL and AUTH_PASSWORD must be set in AlgoTradingPy/.env")
     init_engine()
     if not getattr(app.state, "skip_migrations", False):
         upgrade_database()
     bus.attach_loop(asyncio.get_running_loop())
     record_event("INFO", "BACKEND_STARTED", "system", "Backend started (paper-only execution)")
+    if settings.auth_enabled and not credentials_configured():
+        record_event("ERROR", "AUTH_NOT_CONFIGURED", "auth",
+                     "Login is not configured: set AUTH_EMAIL and AUTH_PASSWORD in .env. Nobody can log in until then.")
 
     restored = paper_service.restore_all()
     if getattr(app.state, "resume_backtests", True):
@@ -67,6 +73,8 @@ def create_app() -> FastAPI:
         description="Backtesting and paper trading for Zerodha Kite market data. Paper-only: no real orders can be placed.",
         lifespan=lifespan,
     )
+    # Every /api, /ws and docs request needs a login session (added first = runs inside CORS).
+    app.add_middleware(AuthMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
@@ -75,7 +83,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     install_error_handlers(app)
-    for module in (strategies, market, backtests, paper, analytics):
+    for module in (auth, strategies, market, backtests, paper, analytics):
         app.include_router(module.router)
     app.include_router(ws_router)
     return app

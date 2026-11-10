@@ -7,14 +7,16 @@ import logging
 import threading
 from datetime import date, datetime
 from typing import Any
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError
 from app.api.schemas import CaptureDatasetRequest, DatasetOut, FeedStartRequest, InstrumentOut, KiteFetchRequest
+from app.core.auth import COOKIE_NAME, issue_state, verify_state, verify_token
 from app.core.config import get_settings
 from app.database.models import BacktestRun, Candle as CandleRow, HistoricalDataset, Instrument, PaperSession
 from app.database.session import get_db, session_scope
@@ -270,15 +272,36 @@ def kite_status() -> dict[str, Any]:
     return kite_sessions.status()
 
 
+KITE_STATE_PURPOSE = "kite-login"
+
+
 @router.get("/api/kite/login-url")
 def kite_login_url() -> dict[str, str]:
-    return {"login_url": kite_sessions.login_url()}
+    # Zerodha passes redirect_params back to the callback as query parameters, so the callback
+    # can tell that this login was started from the app by the signed-in user.
+    state = urlencode({"state": issue_state(KITE_STATE_PURPOSE)})
+    return {"login_url": f"{kite_sessions.login_url()}&{urlencode({'redirect_params': state})}"}
+
+
+def _callback_allowed(request: Request, state: str | None) -> bool:
+    """The callback is public (see PUBLIC_PATHS); accept it only for a login the owner started."""
+    if not get_settings().auth_enabled:
+        return True
+    return verify_state(state, KITE_STATE_PURPOSE) or verify_token(request.cookies.get(COOKIE_NAME)) is not None
 
 
 @router.get("/api/kite/callback")
-def kite_callback(request_token: str | None = None, status: str | None = None) -> RedirectResponse:
+def kite_callback(
+    request: Request,
+    request_token: str | None = None,
+    status: str | None = None,
+    state: str | None = None,
+) -> RedirectResponse:
     """Redirect URL registered in the Kite developer console. Exchanges the request token server-side."""
     frontend = get_settings().frontend_url.rstrip("/")
+    if not _callback_allowed(request, state):
+        record_event("WARNING", "KITE_LOGIN_REJECTED", "kite", "Kite callback rejected: not started from a signed-in session")
+        return RedirectResponse(f"{frontend}/settings?kite=expired")
     if status != "success" or not request_token:
         return RedirectResponse(f"{frontend}/settings?kite=failed")
     try:
