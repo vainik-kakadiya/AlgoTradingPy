@@ -41,9 +41,10 @@ def dataset(client):
 
 
 def test_health_and_settings_hide_secrets(client):
-    assert client.get("/api/health").json()["execution_mode"] == "PAPER_ONLY"
+    assert client.get("/api/health").json()["execution_mode"] == "PAPER_AND_LIVE"
     s = client.get("/api/settings").json()
-    assert "kite_api_secret" not in s and "kite_access_token" not in s and s["execution_mode"] == "PAPER_ONLY"
+    assert "kite_api_secret" not in s and "kite_access_token" not in s and s["execution_mode"] == "PAPER_AND_LIVE"
+    assert s["live"]["max_lots"] == 1 and s["live"]["product"] == "MIS"
     status = client.get("/api/system/status").json()
     assert status["real_orders_possible"] is False
 
@@ -144,7 +145,8 @@ def test_events_and_dashboard(client):
     events = client.get("/api/events", params={"limit": 50}).json()
     assert any(e["event_type"] == "BACKTEST_COMPLETED" for e in events)
     d = client.get("/api/dashboard").json()
-    assert d["system"]["execution_mode"] == "PAPER_ONLY"
+    assert d["system"]["execution_mode"] == "PAPER"  # no real-money session is running
+    assert d["system"]["real_orders_possible"] is False
     assert "paper_all_time" in d and "recent_alerts" in d
 
 

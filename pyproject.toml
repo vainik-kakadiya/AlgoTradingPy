@@ -1,7 +1,7 @@
 [project]
 name = "algotrading-py"
 version = "1.0.0"
-description = "Algo Trading Lab backend: strategy engine, backtesting and paper trading (paper-only, no real orders)."
+description = "Algo Trading Lab backend: strategy engine, backtesting, paper trading and opt-in real-money trading on Zerodha."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi==0.115.6",

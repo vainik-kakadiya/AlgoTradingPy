@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import literal, select
 from sqlalchemy.orm import Session
 
 from app.analytics.performance import (
@@ -56,8 +56,9 @@ def query_trades(
         model, parent, parent_fk = PaperTrade, PaperSession, PaperTrade.paper_session_id
     else:
         raise ValueError("scope must be 'paper' or 'backtest'")
+    mode = PaperSession.trading_mode if scope == "paper" else literal("BACKTEST")
     stmt = (
-        select(model, parent.id, StrategyVersion.version_number, StrategyVersion.id, Strategy.id, Strategy.name)
+        select(model, parent.id, StrategyVersion.version_number, StrategyVersion.id, Strategy.id, Strategy.name, mode)
         .join(parent, parent_fk == parent.id)
         .join(StrategyVersion, parent.strategy_version_id == StrategyVersion.id)
         .join(Strategy, StrategyVersion.strategy_id == Strategy.id)
@@ -83,11 +84,12 @@ def query_trades(
     if symbol:
         stmt = stmt.where(model.tradingsymbol.ilike(f"%{symbol}%"))
     out = []
-    for trade, parent_id, version_number, version_pk, strat_id, strat_name in db.execute(stmt.order_by(model.entry_ts)):
+    for trade, parent_id, version_number, version_pk, strat_id, strat_name, trading_mode in db.execute(stmt.order_by(model.entry_ts)):
         row = {f: getattr(trade, f) for f in TRADE_FIELDS}
         row.update(
             scope=scope, strategy_id=strat_id, strategy_name=strat_name, version_number=version_number, strategy_version_id=version_pk,
             backtest_run_id=parent_id if scope == "backtest" else None, paper_session_id=parent_id if scope == "paper" else None,
+            trading_mode=trading_mode,  # PAPER / LIVE (real money) for sessions, BACKTEST for backtests
         )
         out.append(row)
     return out

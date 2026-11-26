@@ -1,5 +1,7 @@
-"""Paper-trading sessions. There is deliberately no endpoint that places, modifies or cancels
-real orders: every order here is simulated by the PaperBroker."""
+"""Trading sessions. A session is PAPER (simulated by the PaperBroker) or LIVE (real orders on
+Zerodha through the LiveBroker); the mode is chosen when the session starts and never changes.
+There is no endpoint that places, modifies or cancels an individual order: only the strategy of a
+LIVE session does, and stopping a session closes its positions."""
 
 from __future__ import annotations
 
@@ -53,8 +55,10 @@ def _out(db: Session, row: PaperSession) -> PaperSessionOut:
 
 @router.post("", response_model=PaperSessionOut, status_code=201)
 def create_session(body: PaperSessionCreate, db: Session = Depends(get_db)) -> PaperSessionOut:
+    if body.trading_mode == "LIVE" and not body.confirm_live:
+        raise ValueError("Real-money sessions place real orders on Zerodha: confirm with confirm_live=true")
     session_id = paper_service.create(body.strategy_version_id, body.name, body.initial_capital, body.data_source,
-                                      body.dataset_id, body.costs, body.execution)
+                                      body.dataset_id, body.costs, body.execution, body.trading_mode)
     db.expire_all()
     return _out(db, _get(db, session_id))
 
@@ -76,12 +80,20 @@ def get_session(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any
         "metrics": paper_service.session_metrics(session_id, row.initial_capital),
         "strategy_config": row.strategy_config,
         "session_config": row.session_config,
-        "stop_semantics": {
-            "stop_entries": "Blocks new entries. Open simulated positions keep their stop-loss, target and session-end square-off.",
-            "stop": "Cancels pending simulated orders, closes all open simulated positions at the current quote "
-                    "(last known price if no fresh quote, flagged), and ends the session.",
-        },
+        "stop_semantics": LIVE_STOP_SEMANTICS if row.trading_mode == "LIVE" else PAPER_STOP_SEMANTICS,
     }
+
+
+PAPER_STOP_SEMANTICS = {
+    "stop_entries": "Blocks new entries. Open simulated positions keep their stop-loss, target and session-end square-off.",
+    "stop": "Cancels pending simulated orders, closes all open simulated positions at the current quote "
+            "(last known price if no fresh quote, flagged), and ends the session.",
+}
+LIVE_STOP_SEMANTICS = {
+    "stop_entries": "Blocks new entries. Open positions keep their stop-loss order at Zerodha, the target and the session-end square-off.",
+    "stop": "Cancels pending entry orders at Zerodha and exits every open position with a limit order (re-priced until it fills). "
+            "The session shows STOPPING until Zerodha confirms all positions are closed.",
+}
 
 
 @router.post("/{session_id}/stop-entries", response_model=PaperSessionOut)
@@ -96,7 +108,7 @@ def stop_session(session_id: int, body: PaperStopRequest | None = None, db: Sess
     row = _get(db, session_id)
     if paper_service.get(session_id) is not None:
         paper_service.stop(session_id, (body.reason if body else None) or "Stopped by user")
-    elif row.status in ("RUNNING", "ENTRIES_STOPPED"):
+    elif row.status in ("RUNNING", "ENTRIES_STOPPED", "STOPPING"):
         raise LookupError(f"Paper session {session_id} is not loaded in the engine")
     db.expire_all()
     return _out(db, _get(db, session_id))

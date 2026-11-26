@@ -61,8 +61,10 @@ class PaperSession(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     strategy_version_id: Mapped[int] = mapped_column(ForeignKey("strategy_versions.id"), index=True)
     name: Mapped[str] = mapped_column(String(200))
-    status: Mapped[str] = mapped_column(String(20), default="RUNNING")  # RUNNING|ENTRIES_STOPPED|STOPPED|FAILED
+    status: Mapped[str] = mapped_column(String(20), default="RUNNING")  # RUNNING|ENTRIES_STOPPED|STOPPING|STOPPED|FAILED
     data_source: Mapped[str] = mapped_column(String(20))  # KITE | REPLAY
+    # PAPER = simulated fills; LIVE = real orders on Zerodha (chosen when the session starts, never changes).
+    trading_mode: Mapped[str] = mapped_column(String(10), default="PAPER", server_default="PAPER")
     initial_capital: Mapped[float] = mapped_column(Float)
     strategy_config: Mapped[dict] = mapped_column(JSON)
     config_hash: Mapped[str] = mapped_column(String(64))

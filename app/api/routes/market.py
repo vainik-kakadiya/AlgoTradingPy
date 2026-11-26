@@ -157,10 +157,19 @@ def get_candles(
     } for r in rows]}
 
 
+def _live_sessions_active() -> bool:
+    from app.services.runtime import paper_service
+
+    return paper_service.has_live_sessions()
+
+
 @router.post("/api/market-data/feed/start")
 async def start_feed(body: FeedStartRequest) -> dict[str, Any]:
     if body.source == "KITE":
         kite_sessions.ticker_credentials()  # raises if not logged in
+    elif _live_sessions_active():
+        # One feed at a time: a replay would cut real-money sessions off from live prices.
+        raise ApiError(409, "LIVE_SESSION_ACTIVE", "A real-money session is running on live Kite data. Stop it before starting a replay.")
     elif body.dataset_id is None:
         raise ApiError(400, "MISSING_DATASET", "dataset_id is required for REPLAY")
     await hub.start(body.source, body.dataset_id, body.start_date, body.end_date, body.speed)

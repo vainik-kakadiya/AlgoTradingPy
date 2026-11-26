@@ -1,8 +1,9 @@
-"""Zerodha Kite Connect session management - market data only.
+"""Zerodha Kite Connect session management.
 
-The KiteConnect client is always wrapped in ``MarketDataOnlyKite``, which exposes an
-explicit allowlist of non-trading methods. Order placement / modification / cancellation
-methods are unreachable through this module.
+The KiteConnect client is always wrapped: ``client()`` returns a ``MarketDataOnlyKite``
+(market data and session methods only). ``order_client()`` returns a ``LiveOrderKite``
+(regular orders and order/position state only) and is used solely by the live broker of
+real-money sessions.
 
 Access tokens are stored only on the backend, in ``data/.kite_session.json`` (git-ignored),
 and are never returned by the API.
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
-from app.core.safety import MarketDataOnlyKite
+from app.core.safety import LiveOrderKite, MarketDataOnlyKite
 from app.core.timeutil import ist_date, utcnow
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,12 @@ class KiteSessionManager:
         if not self.has_token_for_today:
             raise KiteNotAuthenticated("No valid Kite access token for today; log in via the dashboard")
         return MarketDataOnlyKite(self._raw_client())
+
+    def order_client(self) -> LiveOrderKite:
+        """An order-capable Kite client for real-money (LIVE) sessions only."""
+        if not self.has_token_for_today:
+            raise KiteNotAuthenticated("No valid Kite access token for today; log in to Kite before trading real money")
+        return LiveOrderKite(self._raw_client())
 
     def login_url(self) -> str:
         return MarketDataOnlyKite(self._raw_client()).login_url()

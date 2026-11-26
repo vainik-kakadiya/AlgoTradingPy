@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     feed_stale_seconds: float = Field(default=10.0, gt=0)
     candle_close_grace_seconds: float = Field(default=1.5, ge=0)
 
+    # Real-money (LIVE) sessions. Orders are MIS limit orders on your Zerodha account.
+    live_max_lots: int = Field(default=1, ge=1, le=50)  # hard cap per order; sessions whose strategy trades more are refused
+    live_limit_buffer_pct: float = Field(default=2.0, gt=0, le=20)  # "marketable" limit: best bid/ask ± this %, grows on re-pricing
+    live_stop_limit_buffer_pct: float = Field(default=5.0, gt=0, le=30)  # stop-loss limit price = trigger ∓ this %
+    live_entry_timeout_seconds: float = Field(default=10.0, gt=0)  # unfilled entry orders are cancelled after this
+    live_exit_reprice_seconds: float = Field(default=3.0, gt=0)  # unfilled exit orders are re-priced this often
+    live_order_poll_seconds: float = Field(default=1.0, ge=0.5)  # how often order status is read from Zerodha
+
     log_level: str = "INFO"
 
     # Single-user login (see app/core/auth.py). No default credentials: login is impossible until set.
@@ -81,7 +89,15 @@ class Settings(BaseSettings):
             "capture_ticks": self.capture_ticks,
             "capture_second_bars": self.capture_second_bars,
             "feed_stale_seconds": self.feed_stale_seconds,
-            "execution_mode": "PAPER_ONLY",
+            "execution_mode": "PAPER_AND_LIVE",
+            "live": {
+                "max_lots": self.live_max_lots,
+                "product": "MIS",
+                "limit_buffer_pct": self.live_limit_buffer_pct,
+                "stop_limit_buffer_pct": self.live_stop_limit_buffer_pct,
+                "entry_timeout_seconds": self.live_entry_timeout_seconds,
+                "exit_reprice_seconds": self.live_exit_reprice_seconds,
+            },
             "auth_enabled": self.auth_enabled,
         }
 

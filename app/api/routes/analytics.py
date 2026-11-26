@@ -129,7 +129,7 @@ def list_events(
 @router.get("/api/health")
 def health(db: Session = Depends(get_db)) -> dict[str, Any]:
     db.execute(select(1))
-    return {"status": "ok", "time": utcnow(), "execution_mode": "PAPER_ONLY"}
+    return {"status": "ok", "time": utcnow(), "execution_mode": "PAPER_AND_LIVE"}
 
 
 @router.get("/api/settings")
@@ -148,8 +148,9 @@ def _system_status(db: Session) -> dict[str, Any]:
     feed.pop("subscriptions", None)
     running = db.scalar(select(func.count()).select_from(BacktestRun).where(BacktestRun.status.in_(["QUEUED", "RUNNING"]))) or 0
     return {
-        "execution_mode": "PAPER_ONLY",
-        "real_orders_possible": False,
+        "execution_mode": "LIVE" if paper_service.has_live_sessions() else "PAPER",
+        "real_orders_possible": paper_service.has_live_sessions(),
+        "live_sessions": sum(1 for r in paper_service.runners.values() if r.live),
         "server_time": now,
         "market_phase": market_phase(now),
         "market_phase_note": "Exchange holidays are not modelled; check the NSE calendar.",

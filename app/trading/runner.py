@@ -188,6 +188,9 @@ class StrategyRunner:
         details: dict[str, Any] | None = None,
     ) -> bool:
         """Exit an open position at market. Protective orders are only cancelled once a fill is assured."""
+        if getattr(self.broker, "is_live", False):
+            # Real orders fill later: the live broker starts the exit and books it when Zerodha fills it.
+            return self.broker.exit_position(position, reason, now, quote=quote, details=details)  # type: ignore[attr-defined]
         inst = position.instrument
         exit_side = position.direction.entry_side.opposite()
         quote = quote or self.quotes.get_quote(inst, now)
@@ -366,7 +369,14 @@ class StrategyRunner:
 
     # ================================================================== broker callbacks
     def on_order_update(self, order: Order) -> None:
-        pass
+        # Live entries end asynchronously (timeout / rejection at Zerodha): record the signal's outcome then.
+        if not getattr(self.broker, "is_live", False) or order.purpose is not OrderPurpose.ENTRY or order.filled_quantity:
+            return
+        if order.status in (OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
+            signal = self.signals.get(order.signal_id or "")
+            if signal is not None:
+                outcome = "BLOCKED" if order.status is OrderStatus.REJECTED else "SKIPPED"
+                self.sink.record_signal(signal, outcome, order.rejection_reason or order.status.value, order.meta.get("details", {}))
 
     def on_position_update(self, position: Position) -> None:
         pass

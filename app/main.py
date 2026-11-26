@@ -37,12 +37,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not getattr(app.state, "skip_migrations", False):
         upgrade_database()
     bus.attach_loop(asyncio.get_running_loop())
-    record_event("INFO", "BACKEND_STARTED", "system", "Backend started (paper-only execution)")
+    record_event("INFO", "BACKEND_STARTED", "system", "Backend started")
+    hub.attach_loop(asyncio.get_running_loop())
     if settings.auth_enabled and not credentials_configured():
         record_event("ERROR", "AUTH_NOT_CONFIGURED", "auth",
                      "Login is not configured: set AUTH_EMAIL and AUTH_PASSWORD in .env. Nobody can log in until then.")
 
     restored = paper_service.restore_all()
+    if paper_service.has_live_sessions():
+        hub.ensure_timer()  # keep tracking real orders at Zerodha even before a feed starts
     if getattr(app.state, "resume_backtests", True):
         backtest_jobs.resume_interrupted()
     from app.market_data.kite_client import kite_sessions

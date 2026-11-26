@@ -106,6 +106,29 @@ class MarketDataHub:
             self._flush_buffers()
             self._publish_status(force=True)
 
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def ensure_timer(self) -> None:
+        """Run the clock loop even without a market feed (real-money sessions must keep tracking their
+        orders at Zerodha). Safe to call from any thread once ``attach_loop`` has been called."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            return
+
+        def start() -> None:
+            if self._timer is None or self._timer.done():
+                self._timer = loop.create_task(self._timer_loop())
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            start()
+        else:
+            loop.call_soon_threadsafe(start)
+
     async def shutdown(self) -> None:
         await self.stop("Backend shutting down")
         if self._timer is not None:

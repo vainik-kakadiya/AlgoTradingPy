@@ -1,15 +1,21 @@
-"""Paper-trading sessions driven by live (Kite) or replayed market data.
+"""Trading sessions driven by live (Kite) or replayed market data.
 
-Each session owns a StrategyRunner (the same one backtests use) wired to a PaperBroker
-(simulated fills, persisted) and to the MarketDataHub. Sessions run inside the backend
-process and do not depend on any browser being connected. On restart, RUNNING and
-ENTRIES_STOPPED sessions are restored from the database.
+Each session owns a StrategyRunner (the same one backtests use) wired to the MarketDataHub and
+to a broker chosen by the session's trading mode, which is fixed when the session starts:
+
+* PAPER: a PaperBroker (simulated fills, persisted). Live Kite or replayed data.
+* LIVE: a LiveBroker (real MIS orders on Zerodha, see app/live_trading). Live Kite data only.
+
+Sessions run inside the backend process and do not depend on any browser being connected. On
+restart, RUNNING, ENTRIES_STOPPED and STOPPING sessions are restored from the database.
 
 Stop semantics:
 * stop-entries: no new entries; open positions keep their stop-loss, target and
   session-end square-off.
-* stop: cancels pending orders and closes every open simulated position at the current
+* stop (PAPER): cancels pending orders and closes every open simulated position at the current
   quote (or the last known price, flagged, if no fresh quote exists), then ends the session.
+* stop (LIVE): cancels pending entries and sends exit orders to Zerodha. The session stays
+  STOPPING until Zerodha confirms every position is closed, then becomes STOPPED.
 """
 
 from __future__ import annotations
@@ -17,12 +23,14 @@ from __future__ import annotations
 import logging
 import time as _time
 from datetime import datetime, timedelta
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import select
 
 from app.analytics.performance import trade_metrics
-from app.core.safety import validate_execution_mode
+from app.core.config import get_settings
+from app.core.safety import TradingMode, validate_execution_mode, validate_trading_mode
 from app.core.timeutil import utcnow
 from app.database.models import (
     Candle as CandleRow,
@@ -36,7 +44,9 @@ from app.database.models import (
 from app.database.session import SessionLocal, session_scope
 from app.instruments.contract_resolver import ListCatalog
 from app.instruments.instrument_master import DbCatalog, index_instrument, to_ref
+from app.live_trading.broker import LiveBroker
 from app.market_data.hub import MarketDataHub
+from app.market_data.kite_client import kite_sessions
 from app.services.event_bus import bus, record_event, to_jsonable
 from app.strategies.registry import build_strategy
 from app.trading.costs import CostConfig
@@ -47,7 +57,7 @@ from app.paper_trading.broker import PaperBroker
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_STATUSES = ("RUNNING", "ENTRIES_STOPPED")
+ACTIVE_STATUSES = ("RUNNING", "ENTRIES_STOPPED", "STOPPING")
 
 
 class PaperSink:
@@ -109,11 +119,22 @@ class PaperSessionRunner:
         self.status = row.status
         self.strategy = build_strategy(row.strategy_config)
         validate_execution_mode(self.strategy.config.execution.execution_mode)
+        self.trading_mode = validate_trading_mode(row.trading_mode or "PAPER")
+        self.live = self.trading_mode is TradingMode.LIVE
         cfg = row.session_config
         self.execution = ExecutionModelConfig(**cfg.get("execution", {}))
-        self.broker = PaperBroker(row.id, row.initial_capital, CostConfig(**cfg.get("costs", {})), self.execution)
+        costs = CostConfig(**cfg.get("costs", {}))
+        self.broker: PaperBroker
+        if self.live:
+            self.broker = LiveBroker(row.id, row.initial_capital, costs, self.execution, kite_sessions.order_client, self.clock)
+        else:
+            self.broker = PaperBroker(row.id, row.initial_capital, costs, self.execution)
         self.underlying = underlying
         self.sink = PaperSink(row.id, strategy_id)
+        if isinstance(self.broker, LiveBroker):
+            self.broker.alert = self.sink.event  # every real-order action is written to the session log
+        self.stop_reason: str | None = None
+        self.on_finished: Callable[[int], None] | None = None
         self.runner = StrategyRunner(self.strategy, self.broker, catalog, PaperQuoteSource(self), self.sink, id_prefix=f"PS{row.id}")
         self.runner.on_instrument_selected = self._subscribe_contract
         self.peak_equity = row.initial_capital
@@ -121,6 +142,12 @@ class PaperSessionRunner:
         self._last_equity_ts: datetime | None = None
         self._trade_count = 0
         self.last_market_ts: datetime | None = row.last_market_ts
+
+    def clock(self) -> datetime:
+        """Current time for this session. Real-money sessions always use the real clock (never a replay clock)."""
+        if self.live and self.hub.source != "KITE":
+            return utcnow()
+        return self.hub.now()
 
     # ------------------------------------------------------------------ lifecycle
     def start(self, restore: bool, runtime_state: dict[str, Any] | None) -> None:
@@ -138,6 +165,13 @@ class PaperSessionRunner:
         if self.data_source == "KITE":
             self.runner.seed_history(self._stored_candles())
         self.hub.add_listener(self)
+        if restore and isinstance(self.broker, LiveBroker):
+            now = self.clock()
+            self.broker.protect_open_positions(now)  # every open real position must have a stop at Zerodha
+            if self.status == "STOPPING":
+                self.stop_reason = "Stopped by user"
+                self.runner.stop_entries("Session stopping")
+                self.runner.close_all("SESSION_STOPPED", now, force=True)
 
     def _stored_candles(self) -> list[Candle]:
         if self.underlying.instrument_id is None:
@@ -174,13 +208,25 @@ class PaperSessionRunner:
             self.runner.on_quote(quote, now)
 
     def on_candle(self, instrument_key: str, candle: Candle, now: datetime) -> None:
-        if not self._active() or instrument_key != self.underlying.key or candle.interval_seconds != self.strategy.timeframe_seconds:
+        if not self._active() or self.status == "STOPPING" or instrument_key != self.underlying.key or candle.interval_seconds != self.strategy.timeframe_seconds:
             return
         self.runner.on_candle(candle, now)
         bus.publish("strategy_candle", {"paper_session_id": self.session_id, **candle.to_dict()})
         self.persist(now, force=True)
 
     def on_time(self, now: datetime) -> None:
+        if isinstance(self.broker, LiveBroker):
+            # Real orders are tracked even while the market feed is down; time exits (e.g. the
+            # session-end square-off) still run, using the last known prices.
+            now = self.clock()
+            self.broker.on_time(now)
+            if self.status == "STOPPING":
+                self._finish_stop_if_flat(now)
+            if self.status not in ACTIVE_STATUSES:
+                return
+            self.runner.on_time(now)
+            self.persist(now)
+            return
         if not self._active():
             return
         self.runner.on_time(now)
@@ -193,6 +239,16 @@ class PaperSessionRunner:
         self.persist(self.hub.now(), force=True)
 
     def stop(self, reason: str) -> None:
+        if isinstance(self.broker, LiveBroker):
+            # Real positions close when Zerodha fills the exits, not instantly: stay STOPPING until flat.
+            now = self.clock()
+            self.stop_reason = reason
+            self.runner.stop_entries(reason)
+            self.runner.close_all("SESSION_STOPPED", now, force=True)
+            self.status = "STOPPING"
+            self.persist(now, force=True)
+            self._finish_stop_if_flat(now)
+            return
         now = self.hub.now() if self.hub.source == self.data_source else utcnow()
         self.runner.stop_entries(reason)
         self.runner.close_all("SESSION_STOPPED", now, force=True)
@@ -201,6 +257,20 @@ class PaperSessionRunner:
         self.status = "STOPPED"
         self.persist(now, force=True, stop_reason=reason)
         self.detach()
+
+    def _finish_stop_if_flat(self, now: datetime) -> None:
+        """A stopping real-money session ends once nothing is open or working at Zerodha."""
+        if self.broker.open_positions() or any(not (o.meta.get("virtual") or o.meta.get("external")) for o in self.broker.active_orders()):
+            return
+        for order in self.broker.active_orders():
+            self.broker.cancel(order.client_order_id, now, "SESSION_STOPPED")
+        self.status = "STOPPED"
+        self.persist(now, force=True, stop_reason=self.stop_reason or "Stopped by user")
+        self.detach()
+        record_event("INFO", "SESSION_STOPPED", "paper_trading", f"Real-money session {self.session_id} stopped: all positions closed",
+                     paper_session_id=self.session_id)
+        if self.on_finished is not None:
+            self.on_finished(self.session_id)
 
     # ------------------------------------------------------------------ persistence
     def summary(self) -> dict[str, Any]:
@@ -275,10 +345,16 @@ class PaperTradingService:
         return DbCatalog(SessionLocal), idx
 
     def create(self, version_id: int, name: str, initial_capital: float, data_source: str, dataset_id: int | None,
-               costs: CostConfig, execution: ExecutionModelConfig) -> int:
+               costs: CostConfig, execution: ExecutionModelConfig, trading_mode: str = "PAPER") -> int:
         data_source = data_source.upper()
         if data_source not in ("KITE", "REPLAY"):
             raise ValueError("data_source must be KITE or REPLAY")
+        mode = validate_trading_mode(trading_mode)
+        if mode is TradingMode.LIVE:
+            if data_source != "KITE":
+                raise ValueError("Real-money sessions trade on live Kite data only; choose 'Live Kite data'")
+            if not kite_sessions.has_token_for_today:
+                raise ValueError("Log in to Kite (Settings) before starting a real-money session")
         with session_scope() as db:
             version = db.get(StrategyVersion, version_id)
             if version is None:
@@ -287,10 +363,15 @@ class PaperTradingService:
                 raise ValueError("Strategy is disabled; enable it before starting a paper session")
             strategy = build_strategy(version.config_json)
             validate_execution_mode(strategy.config.execution.execution_mode)
+            cap = get_settings().live_max_lots
+            if mode is TradingMode.LIVE and strategy.quantity_lots > cap:
+                raise ValueError(f"This strategy trades {strategy.quantity_lots} lot(s) per order, but real-money sessions are limited to "
+                                 f"{cap} (LIVE_MAX_LOTS in AlgoTradingPy/.env). Lower the strategy's lots or raise the cap.")
             catalog, underlying = self._catalog_and_underlying(db, data_source, dataset_id, strategy.underlying)
             row = PaperSession(
                 strategy_version_id=version.id, name=name, status="RUNNING", data_source=data_source,
                 initial_capital=initial_capital, strategy_config=version.config_json, config_hash=version.config_hash,
+                trading_mode=mode.value,
                 session_config={"costs": costs.model_dump(), "execution": execution.model_dump(), "dataset_id": dataset_id},
                 cash=initial_capital, started_at=utcnow(),
             )
@@ -299,10 +380,15 @@ class PaperTradingService:
             session_id = row.id
             strategy_id = version.strategy_id
             runner = PaperSessionRunner(row, self.hub, catalog, underlying, strategy_id)
+        runner.on_finished = self._finished
         runner.start(restore=False, runtime_state=None)
         self.runners[session_id] = runner
-        record_event("INFO", "SESSION_STARTED", "paper_trading", f"Paper session {session_id} '{name}' started ({data_source})",
-                     {"strategy_version_id": version_id}, paper_session_id=session_id, strategy_id=strategy_id)
+        label = "REAL-MONEY session" if runner.live else "Paper session"
+        record_event("WARNING" if runner.live else "INFO", "SESSION_STARTED", "paper_trading",
+                     f"{label} {session_id} '{name}' started ({data_source})",
+                     {"strategy_version_id": version_id, "trading_mode": mode.value}, paper_session_id=session_id, strategy_id=strategy_id)
+        if runner.live:
+            self.hub.ensure_timer()
         runner.persist(self.hub.now(), force=True)
         return session_id
 
@@ -320,6 +406,7 @@ class PaperTradingService:
                         db, row.data_source, (row.session_config or {}).get("dataset_id"), build_strategy(row.strategy_config).underlying)
                     runner = PaperSessionRunner(row, self.hub, catalog, underlying, version.strategy_id if version else None)
                     runtime_state, data_source = row.runtime_state, row.data_source
+                runner.on_finished = self._finished
                 runner.start(restore=True, runtime_state=runtime_state)
                 self.runners[session_id] = runner
                 restored += 1
@@ -343,6 +430,12 @@ class PaperTradingService:
     def get(self, session_id: int) -> PaperSessionRunner | None:
         return self.runners.get(session_id)
 
+    def has_live_sessions(self) -> bool:
+        return any(r.live for r in self.runners.values())
+
+    def _finished(self, session_id: int) -> None:
+        self.runners.pop(session_id, None)
+
     def stop_entries(self, session_id: int) -> None:
         runner = self._require(session_id)
         runner.stop_entries("New entries stopped by user")
@@ -352,6 +445,11 @@ class PaperTradingService:
     def stop(self, session_id: int, reason: str = "Stopped by user") -> None:
         runner = self._require(session_id)
         runner.stop(reason)
+        if runner.live:
+            if runner.status == "STOPPING":
+                record_event("WARNING", "SESSION_STOPPING", "paper_trading",
+                             f"Real-money session {session_id} stopping: closing positions at Zerodha ({reason})", paper_session_id=session_id)
+            return  # STOPPED (and removed) once Zerodha confirms everything is closed
         self.runners.pop(session_id, None)
         record_event("INFO", "SESSION_STOPPED", "paper_trading", f"Paper session {session_id} stopped: {reason}",
                      paper_session_id=session_id)
@@ -367,7 +465,7 @@ class PaperTradingService:
         if runner is None:
             return None
         fresh, reason = PaperQuoteSource(runner).data_freshness(self.hub.now())
-        return {**runner.summary(), "data_fresh": fresh, "stale_reason": reason,
+        return {**runner.summary(), "trading_mode": runner.trading_mode.value, "data_fresh": fresh, "stale_reason": reason,
                 "pending_entries": len(runner.runner.pending_entries), "underlying": runner.underlying.key}
 
     def session_metrics(self, session_id: int, initial_capital: float) -> dict[str, Any]:

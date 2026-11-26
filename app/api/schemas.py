@@ -188,6 +188,9 @@ class PaperSessionCreate(BaseModel):
     dataset_id: int | None = None
     costs: CostConfig = Field(default_factory=CostConfig)
     execution: ExecutionModelConfig = Field(default_factory=ExecutionModelConfig)
+    # LIVE places real orders on Zerodha and must be confirmed explicitly.
+    trading_mode: Literal["PAPER", "LIVE"] = "PAPER"
+    confirm_live: bool = False
 
 
 class PaperStopRequest(BaseModel):
@@ -200,6 +203,7 @@ class PaperSessionOut(ORM):
     name: str
     status: str
     data_source: str
+    trading_mode: str = "PAPER"
     initial_capital: float
     config_hash: str
     entries_enabled: bool
@@ -294,6 +298,7 @@ class TradeOut(ORM):
     backtest_run_id: int | None = None
     paper_session_id: int | None = None
     scope: str | None = None
+    trading_mode: str | None = None
     strategy_name: str | None = None
     version_number: int | None = None
 
